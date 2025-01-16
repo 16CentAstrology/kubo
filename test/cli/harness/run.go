@@ -3,6 +3,7 @@ package harness
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -14,8 +15,10 @@ type Runner struct {
 	Verbose bool
 }
 
-type CmdOpt func(*exec.Cmd)
-type RunFunc func(*exec.Cmd) error
+type (
+	CmdOpt  func(*exec.Cmd)
+	RunFunc func(*exec.Cmd) error
+)
 
 var RunFuncStart = (*exec.Cmd).Start
 
@@ -38,19 +41,47 @@ type RunResult struct {
 	Cmd     *exec.Cmd
 }
 
+func (r *RunResult) ExitCode() int {
+	return r.Cmd.ProcessState.ExitCode()
+}
+
 func environToMap(environ []string) map[string]string {
 	m := map[string]string{}
 	for _, e := range environ {
 		kv := strings.Split(e, "=")
+		// Skip environment variables that start with =
+		// These can occur in Windows https://github.com/golang/go/issues/61956
+		if kv[0] == "" {
+			continue
+		}
 		m[kv[0]] = kv[1]
 	}
 	return m
 }
 
-func (r *Runner) Run(req RunRequest) RunResult {
+func (r *Runner) Run(req RunRequest) *RunResult {
 	cmd := exec.Command(req.Path, req.Args...)
-	stdout := &Buffer{}
-	stderr := &Buffer{}
+	var stdout io.Writer
+	var stderr io.Writer
+	outbuf := &Buffer{}
+	errbuf := &Buffer{}
+
+	if r.Verbose {
+		or, ow := io.Pipe()
+		errr, errw := io.Pipe()
+		stdout = io.MultiWriter(outbuf, ow)
+		stderr = io.MultiWriter(errbuf, errw)
+		go func() {
+			_, _ = io.Copy(os.Stdout, or)
+		}()
+		go func() {
+			_, _ = io.Copy(os.Stderr, errr)
+		}()
+	} else {
+		stdout = outbuf
+		stderr = errbuf
+	}
+
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Dir = r.Dir
@@ -72,8 +103,8 @@ func (r *Runner) Run(req RunRequest) RunResult {
 	err := req.RunFunc(cmd)
 
 	result := RunResult{
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdout: outbuf,
+		Stderr: errbuf,
 		Cmd:    cmd,
 		Err:    err,
 	}
@@ -82,25 +113,23 @@ func (r *Runner) Run(req RunRequest) RunResult {
 		result.ExitErr = exitErr
 	}
 
-	return result
+	return &result
 }
 
 // MustRun runs the command and fails the test if the command fails.
-func (r *Runner) MustRun(req RunRequest) RunResult {
+func (r *Runner) MustRun(req RunRequest) *RunResult {
 	result := r.Run(req)
 	r.AssertNoError(result)
 	return result
 }
 
-func (r *Runner) AssertNoError(result RunResult) {
+func (r *Runner) AssertNoError(result *RunResult) {
 	if result.ExitErr != nil {
 		log.Panicf("'%s' returned error, code: %d, err: %s\nstdout:%s\nstderr:%s\n",
 			result.Cmd.Args, result.ExitErr.ExitCode(), result.ExitErr.Error(), result.Stdout.String(), result.Stderr.String())
-
 	}
 	if result.Err != nil {
 		log.Panicf("unable to run %s: %s", result.Cmd.Path, result.Err)
-
 	}
 }
 
@@ -137,4 +166,16 @@ func RunWithStdin(reader io.Reader) CmdOpt {
 
 func RunWithStdinStr(s string) CmdOpt {
 	return RunWithStdin(strings.NewReader(s))
+}
+
+func RunWithStdout(writer io.Writer) CmdOpt {
+	return func(cmd *exec.Cmd) {
+		cmd.Stdout = io.MultiWriter(writer, cmd.Stdout)
+	}
+}
+
+func RunWithStderr(writer io.Writer) CmdOpt {
+	return func(cmd *exec.Cmd) {
+		cmd.Stderr = io.MultiWriter(writer, cmd.Stdout)
+	}
 }
